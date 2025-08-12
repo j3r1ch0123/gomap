@@ -7,6 +7,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -27,7 +28,6 @@ func init() {
         `
 		fmt.Println(banner)
 		fmt.Println("Usage: gomap [options]")
-		fmt.Println("Options:")
 		flag.PrintDefaults()
 	}
 }
@@ -48,45 +48,71 @@ func grabBanner(host string, port int) {
 	}
 }
 
-func scanTCPPorts(host string, ports []int, showBanners bool) {
-	for _, port := range ports {
-		address := fmt.Sprintf("%s:%d", host, port)
-		conn, err := net.DialTimeout("tcp", address, 500*time.Millisecond)
-		if err == nil {
-			fmt.Printf(green+"TCP %d is open\n"+reset, port)
-			conn.Close()
+func scanTCPPorts(host string, ports []int, showBanners bool, threads int) {
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, threads) // limit concurrency
 
-			if showBanners {
-				grabBanner(host, port)
+	for _, port := range ports {
+		wg.Add(1)
+		sem <- struct{}{} // occupy a slot
+
+		go func(p int) {
+			defer wg.Done()
+			defer func() { <-sem }() // free slot
+
+			address := fmt.Sprintf("%s:%d", host, p)
+			conn, err := net.DialTimeout("tcp", address, 500*time.Millisecond)
+			if err == nil {
+				fmt.Printf(green+"TCP %d is open\n"+reset, p)
+				conn.Close()
+
+				if showBanners {
+					grabBanner(host, p)
+				}
 			}
-		}
+		}(port)
 	}
+
+	wg.Wait()
 }
 
-func scanUDPPorts(host string, ports []int) {
+func scanUDPPorts(host string, ports []int, threads int) {
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, threads)
+
 	for _, port := range ports {
-		addr := fmt.Sprintf("%s:%d", host, port)
-		conn, err := net.DialTimeout("udp", addr, 500*time.Millisecond)
-		if err != nil {
-			continue
-		}
+		wg.Add(1)
+		sem <- struct{}{}
 
-		_, err = conn.Write([]byte("ping"))
-		if err != nil {
+		go func(p int) {
+			defer wg.Done()
+			defer func() { <-sem }()
+
+			addr := fmt.Sprintf("%s:%d", host, p)
+			conn, err := net.DialTimeout("udp", addr, 500*time.Millisecond)
+			if err != nil {
+				return
+			}
+
+			_, err = conn.Write([]byte("ping"))
+			if err != nil {
+				conn.Close()
+				return
+			}
+
+			conn.SetReadDeadline(time.Now().Add(1 * time.Second))
+			buf := make([]byte, 1024)
+			_, err = conn.Read(buf)
+
+			if err == nil {
+				fmt.Printf(green+"UDP %d is open or responding\n"+reset, p)
+			}
+
 			conn.Close()
-			continue
-		}
-
-		conn.SetReadDeadline(time.Now().Add(1 * time.Second))
-		buf := make([]byte, 1024)
-		_, err = conn.Read(buf)
-
-		if err == nil {
-			fmt.Printf(green+"UDP %d is open or responding\n"+reset, port)
-		}
-
-		conn.Close()
+		}(port)
 	}
+
+	wg.Wait()
 }
 
 func parsePorts(rangeStr string) ([]int, error) {
@@ -110,11 +136,13 @@ func parsePorts(rangeStr string) ([]int, error) {
 func main() {
 	var host, portRange string
 	var udp, banners bool
+	var threads int
 
 	flag.StringVar(&host, "host", "localhost", "Host to scan")
 	flag.StringVar(&portRange, "ports", "1-1024", "Port range to scan (e.g., 20-80)")
 	flag.BoolVar(&udp, "udp", false, "Use UDP instead of TCP")
 	flag.BoolVar(&banners, "banners", false, "Try to grab service banners on open TCP ports")
+	flag.IntVar(&threads, "threads", 100, "Number of concurrent scans")
 	flag.Parse()
 
 	if len(os.Args) == 1 {
@@ -129,10 +157,10 @@ func main() {
 	}
 
 	if udp {
-		fmt.Printf("Starting UDP scan on %s (%d ports)...\n", host, len(ports))
-		scanUDPPorts(host, ports)
+		fmt.Printf("Starting UDP scan on %s (%d ports) with %d threads...\n", host, len(ports), threads)
+		scanUDPPorts(host, ports, threads)
 	} else {
-		fmt.Printf("Starting TCP scan on %s (%d ports)...\n", host, len(ports))
-		scanTCPPorts(host, ports, banners)
+		fmt.Printf("Starting TCP scan on %s (%d ports) with %d threads...\n", host, len(ports), threads)
+		scanTCPPorts(host, ports, banners, threads)
 	}
 }
